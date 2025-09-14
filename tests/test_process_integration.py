@@ -68,19 +68,13 @@ async def test_run_neighbors_by_id_pipeline():
 
     # Basic shape assertions
     assert result["v"] == 1
-    assert result["mode"] == "neighbors_by_id"
-    assert isinstance(result["seed_count"], int)
-    assert isinstance(result["neighbor_count"], int)
-    assert isinstance(result["neighbors"], list)
+    # New minimal format exposes `items` with only id and title
+    items = result.get("items") or result.get("neighbors")
+    assert isinstance(items, list)
 
-    # If no data available, neighbors could be empty; but typically expect some
-    if result["neighbors"]:
-        n0 = result["neighbors"][0]
-        assert "family_id" in n0
-        assert "similarity" in n0
-        sim = n0["similarity"]
-        if sim is not None:
-            assert 0.0 <= sim <= 1.0
-        # Ensure seed provenance structure exists
-        assert "source_seeds" in n0
-
+    if items:
+        it0 = items[0]
+        assert "family_id" in it0
+        assert "title" in it0
+        # With dimensionality reduction we expose x,y
+        assert "x" in it0 and "y" in it0

@@ -16,8 +16,10 @@ flowchart TD
     H -->|RPC| I[DB: nn_ip_patent_family_search_by_id - client_uid, family_id, k]
     I --> H
     H -->|merge| J[Aggregate unique neighbors best similarity, union sources]
-    J --> K[Assemble _output JSON]
-    K --> L[send_results -> _output, _status=done]
+    J --> K[Fetch embeddings]
+    K --> L[Dimensionality reduction (UMAP 2D)]
+    L --> M[Assemble _output JSON\n(minimal: family_id, title, x, y, is_seed)]
+    M --> N[send_results -> _output, _status=done]
 ```
 
 ## Key Components
@@ -34,7 +36,8 @@ flowchart TD
     - Collects seed family IDs from nodes (and CPC exact code reverse lookup).
     - For each seed, calls RPC `nn_ip_patent_family_search_by_id` and merges results.
     - Emits status updates along the way.
-    - Returns a compact `_output` object with neighbors and metadata.
+- Returns a compact `_output` object with `family_id`, `title`, `x`, `y`, `is_seed` per item and includes the seed items as well.
+    - Uses UMAP (n_neighbors=3, min_dist=0.1, metric=euclidean). Falls back to PCA if UMAP is not available.
 
 ## Database Expectations
 
@@ -54,20 +57,13 @@ Optional (fallback from earlier MVP): `match_export_embeddings(query_embedding v
 ```json
 {
   "v": 1,
-  "mode": "neighbors_by_id",
-  "seed_count": 3,
-  "neighbor_count": 200,
-  "neighbors": [
+  "items": [
     {
       "family_id": "1234567",
-      "similarity": 0.87,
       "title": "...",
-      "abstract": "...",
-      "family_authorities": ["EP", "US"],
-      "first_application_pub_date": "2019-05-22",
-      "sonar_is_active": false,
-      "lists": [{"name": "Watchlist A", "list_uid": "..."}],
-      "source_seeds": [1111111, 2222222]
+      "x": 1.234,
+      "y": -0.456,
+      "is_seed": true
     }
   ]
 }
@@ -82,4 +78,3 @@ The worker writes `_status`, `_progress`, and `_message` to keep users informed:
 
 - Environment: `SUPABASE_URL`, `SUPABASE_KEY` for the worker.
 - Realtime channel/table: `ip_landscapes` (default).
-

@@ -3,6 +3,12 @@ from __future__ import annotations
 from typing import List, Optional, Union, Literal, Annotated, Dict, Any, Set, Tuple
 from pydantic import BaseModel, Field, ConfigDict
 import asyncio
+import numpy as np
+try:
+    import umap
+    _HAS_UMAP = True
+except Exception:
+    _HAS_UMAP = False
 
 # -----------------
 # Filters & helpers
@@ -181,32 +187,59 @@ async def run(
     await status_cb(uid, "calculating", 30, {"_message": f"Running NN search (k={k}) by seed id"})
     neighbors = await _neighbors_by_seeds(client_uid, supabase_client, seed_family_ids, k)
 
-    await status_cb(uid, "calculating", 80, {"_message": f"Aggregated {len(neighbors)} unique neighbors"})
+    await status_cb(uid, "calculating", 55, {"_message": f"Aggregated {len(neighbors)} unique neighbors"})
 
-    items = [
-        {
+    # Include seeds as items as well
+    seed_set: Set[int] = set(int(s) for s in seed_family_ids)
+    all_ids: List[int] = sorted(set(list(neighbors.keys())) | seed_set)
+
+    # Fetch embeddings for dimensionality reduction (x,y) for all ids
+    emb_map = await _fetch_embeddings_map(supabase_client, all_ids)
+
+    # Compute 2D projection for those with embeddings; default (0,0) otherwise
+    ordered_ids: List[int] = [fid for fid in all_ids if fid in emb_map]
+    X = np.array([emb_map[fid] for fid in ordered_ids], dtype=float)
+
+    xs: List[float] = []
+    ys: List[float] = []
+    if len(ordered_ids) >= 2 and X.ndim == 2 and X.shape[0] >= 2:
+        coords = _umap_2d(X)
+        xs = coords[:, 0].tolist()
+        ys = coords[:, 1].tolist()
+    else:
+        xs = [0.0 for _ in ordered_ids]
+        ys = [0.0 for _ in ordered_ids]
+
+    id_to_xy = {fid: (xs[i], ys[i]) for i, fid in enumerate(ordered_ids)}
+
+    # Fetch titles for all ids (uniformly); neighbors may already include titles
+    meta = await _fetch_family_metadata(supabase_client, all_ids)
+    title_map: Dict[int, str] = {}
+    for row in meta:
+        try:
+            fid = int(row.get("family_id")) if row.get("family_id") is not None else None
+        except Exception:
+            fid = None
+        if fid is not None:
+            title_map[fid] = row.get("title") or ""
+
+    # Build items for all ids, flagging seeds
+    items: List[Dict[str, Any]] = []
+    for fid in all_ids:
+        x, y = id_to_xy.get(fid, (0.0, 0.0))
+        title = title_map.get(fid) or (neighbors.get(fid, {}).get("title") if fid in neighbors else "") or ""
+        items.append({
             "family_id": str(fid),
-            "similarity": data["similarity"],
-            "title": data.get("title"),
-            "abstract": data.get("abstract"),
-            "family_authorities": data.get("family_authorities"),
-            "first_application_pub_date": data.get("first_application_pub_date"),
-            "sonar_is_active": data.get("sonar_is_active"),
-            "lists": data.get("lists"),
-            "source_seeds": sorted(list(data.get("source_seeds", []))),
-        }
-        for fid, data in neighbors.items()
-    ]
+            "title": title,
+            "x": float(x),
+            "y": float(y),
+            "is_seed": bool(fid in seed_set),
+        })
 
     await status_cb(uid, "calculating", 90, {"_message": "Assembled result payload"})
 
-    return {
-        "v": 1,
-        "mode": "neighbors_by_id",
-        "seed_count": len(seed_family_ids),
-        "neighbor_count": len(items),
-        "neighbors": items,
-    }
+    # Temporary compatibility: mirror items into `neighbors` for legacy UIs
+    return {"v": 1, "items": items, "neighbors": items, "neighbor_count": len(items)}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -287,6 +320,32 @@ async def _fetch_embeddings_for_families(supabase_client, family_ids: List[int])
             if isinstance(vec, list) and vec:
                 embeddings.append(vec)
     return embeddings
+
+
+async def _fetch_embeddings_map(supabase_client, family_ids: List[int]) -> Dict[int, List[float]]:
+    if not family_ids:
+        return {}
+    out: Dict[int, List[float]] = {}
+    chunk_size = 1000
+    for i in range(0, len(family_ids), chunk_size):
+        chunk = family_ids[i:i + chunk_size]
+        def _do():
+            return (
+                supabase_client.table("export_embeddings")
+                .select("docdb_family_id, embedding")
+                .in_("docdb_family_id", chunk)
+                .execute()
+            )
+        resp = await _run_in_threadpool(_do)
+        for row in (resp.data or []):
+            fid = row.get("docdb_family_id")
+            vec_raw = row.get("embedding")
+            if fid is None:
+                continue
+            vec = _parse_embedding(vec_raw)
+            if vec is not None and len(vec) > 0:
+                out[int(fid)] = vec
+    return out
 
 
 def _compute_centroid(vectors: List[List[float]]) -> Optional[List[float]]:
@@ -373,6 +432,44 @@ async def _neighbors_by_seeds(
         results.pop(int(s), None)
 
     return results
+
+
+def _umap_2d(X: np.ndarray) -> np.ndarray:
+    """UMAP 2D projection; falls back to PCA if UMAP unavailable."""
+    if _HAS_UMAP:
+        reducer = umap.UMAP(n_components=2, n_neighbors=3, min_dist=0.1, metric="euclidean")
+        return reducer.fit_transform(X)
+    # Fallback to PCA if umap not installed
+    Xc = X - X.mean(axis=0, keepdims=True)
+    U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+    components = Vt[:2, :]
+    return Xc @ components.T
+
+
+def _parse_embedding(v: Any) -> Optional[List[float]]:
+    """Parse embedding value from PostgREST/Supabase into a list[float].
+    Accepts list/tuple/ndarray or a string representation like "[1,2,3]" or "{1,2,3}" or "(1,2,3)".
+    """
+    import numpy as _np
+    # Already a sequence of numbers
+    if isinstance(v, (list, tuple, _np.ndarray)):
+        try:
+            return [float(x) for x in list(v)]
+        except Exception:
+            return None
+    # String representation
+    if isinstance(v, str):
+        s = v.strip()
+        # Remove common wrappers
+        if (s.startswith("[") and s.endswith("]")) or (s.startswith("(") and s.endswith(")")) or (s.startswith("{") and s.endswith("}")):
+            s = s[1:-1]
+        # Split and parse
+        parts = [p for p in s.split(",") if p.strip()]
+        try:
+            return [float(p) for p in parts]
+        except Exception:
+            return None
+    return None
 
 
 async def _fetch_family_metadata(supabase_client, family_ids: List[int]) -> List[Dict[str, Any]]:
