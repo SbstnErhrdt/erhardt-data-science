@@ -1,0 +1,27 @@
+version: '3.9'
+
+networks:
+  proxy:
+    driver: bridge
+    external: true
+
+services:
+  patent_portfolio_processor:
+    image: registry.erhardt.net/patent-portfolio-processor
+    restart: unless-stopped
+    networks:
+      - proxy
+    environment:
+      MAX_WORKERS: 1
+      SQL_HOST: ${SQL_HOST}
+      SQL_USER: ${SQL_USER}
+      SQL_PASSWORD: ${SQL_PASSWORD}
+      SQL_PORT: ${SQL_PORT}
+      SQL_DATABASE: ${SQL_DATABASE}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=proxy"
+      - "traefik.http.routers.patent-portfolio-processor.service=patent-portfolio-processor"
+      - "traefik.http.routers.patent-portfolio-processor.tls=true"
+      - "traefik.http.services.patent-portfolio-processor.loadbalancer.server.port=80"
+      - "traefik.http.routers.patent-portfolio-processor.rule=Host(`patent-portfolio-processor.erhardt.net`)"
