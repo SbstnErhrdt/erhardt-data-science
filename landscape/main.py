@@ -225,7 +225,7 @@ class RealtimeWorker:
             schema="public",
             table=self.settings.table,
             filter="_status=eq.to_calculate",
-            callback=make_callback,
+            callback=make_callback(),
         ).subscribe()
 
         logger.info("Subscribed to %s (filter: _status=eq.to_calculate)", self.settings.table)
