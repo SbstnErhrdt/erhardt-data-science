@@ -135,11 +135,14 @@ async def process_record(uid: str, record: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("Missing 'search_vectors' in record")
 
     search_vectors = process.parse(record["search_vectors"])
+    client_uid = record.get("client_uid")
+    if not client_uid:
+        raise ValueError("Missing 'client_uid' in record")
 
     async def _status(uid_: str, status: str, progress: int, extra: Optional[Dict[str, Any]] = None):
         await send_status_update(uid_, status, progress, extra)
 
-    result = await process.run(uid, search_vectors, supabase, _status)
+    result = await process.run(uid, client_uid, search_vectors, supabase, _status)
     return result
 
 

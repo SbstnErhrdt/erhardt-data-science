@@ -203,3 +203,73 @@ grant delete, insert, references, select, trigger, truncate, update on ip_patent
 grant delete, insert, references, select, trigger, truncate, update on ip_patent_families to authenticated;
 
 grant delete, insert, references, select, trigger, truncate, update on ip_patent_families to service_role;
+
+
+create function nn_ip_patent_family_search_by_id(c_uid uuid, p_id integer, k integer DEFAULT 10)
+    returns TABLE(patent_family_id text, title text, abstract text, family_authorities character varying[], first_application_pub_date date, similarity double precision, sonar_is_active boolean, lists json[])
+    language plpgsql
+as
+$$
+DECLARE
+    q vector(1024);
+BEGIN
+    SELECT e.embedding
+    INTO q
+    FROM export_embeddings AS e
+    WHERE e.docdb_family_id = p_id;
+
+    IF q IS NULL THEN
+        RAISE EXCEPTION 'No embedding for family_id=%', p_id;
+    END IF;
+
+    PERFORM set_config('hnsw.ef_search', '24', true);
+
+    RETURN QUERY
+        with q as (SELECT e.docdb_family_id,
+                          1 - (e.embedding <=> q) AS cosine_similarity -- now types match
+                   FROM export_embeddings AS e
+                   WHERE e.docdb_family_id <> p_id
+                   ORDER BY e.embedding <=> q
+                   LIMIT k),
+             client_sonar AS (SELECT s.patent_family_id,
+                                     s.client_uid,
+                                     s.uid as sonar_uid,
+                                     s.radius,
+                                     s.created_at,
+                                     s.created_by,
+                                     s.deactivated_at
+                              FROM ip_patent_sonars AS s
+                              WHERE s.client_uid = c_uid
+                                AND s.deactivated_at IS NULL),
+             patent_lists AS (SELECT *
+                              from ip_patent_lists
+                              where client_uid = c_uid),
+             patent_list_items AS (SELECT i.patent_family_id,
+                                          array_agg(json_build_object('name', l.name, 'list_uid', l.uid)) as lists
+                                   from ip_patent_list_items as i
+                                            left join patent_lists as l on l.uid = i.list_uid
+                                   where i.client_uid = c_uid
+                                   group by i.patent_family_id)
+        SELECT f.family_id                                                as patent_family_id,
+               f.title::text                                              as title,
+               f.abstract                                                 as abstract,
+               f.family_authorities                                       as family_authorities,
+               f.first_application_pub_date                               as first_application_pub_date,
+               round(q.cosine_similarity::numeric, 4)::double precision   as similarity,
+               CASE WHEN c.sonar_uid IS NOT NULL THEN true ELSE false END as sonar_is_active,
+               pli.lists                                                  as lists
+        from ip_patent_families as f
+                 JOIN q ON f.family_id = q.docdb_family_id::text
+                 LEFT JOIN client_sonar as c ON c.patent_family_id = f.family_id
+                 LEFT JOIN patent_list_items as pli ON pli.patent_family_id = f.family_id;
+END
+$$;
+
+alter function nn_ip_patent_family_search_by_id(uuid, integer, integer) owner to postgres;
+
+grant execute on function nn_ip_patent_family_search_by_id(uuid, integer, integer) to anon;
+
+grant execute on function nn_ip_patent_family_search_by_id(uuid, integer, integer) to authenticated;
+
+grant execute on function nn_ip_patent_family_search_by_id(uuid, integer, integer) to service_role;
+
