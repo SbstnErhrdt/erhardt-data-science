@@ -1,7 +1,7 @@
 import os
 import uuid
+
 import pytest
-import asyncio
 
 from dotenv import load_dotenv
 
@@ -60,7 +60,7 @@ async def test_run_neighbors_by_id_pipeline():
     job_uid = str(uuid.uuid4())
     client_uid = str(uuid.uuid4())
 
-    async def status_cb(uid: str, status: str, progress: int, extra=None):
+    async def status_cb(status: str, progress: int, extra=None):
         # No-op for tests; could print for debugging
         return None
 

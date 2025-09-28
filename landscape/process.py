@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from typing import List, Optional, Union, Literal, Annotated, Dict, Any, Set, Tuple
-from pydantic import BaseModel, Field, ConfigDict
+from typing import Annotated, Any, Awaitable, Callable, Dict, List, Literal, Optional, Set, Tuple, Union
+
 import asyncio
 import numpy as np
+from pydantic import BaseModel, ConfigDict, Field
 try:
     import umap
     _HAS_UMAP = True
@@ -159,12 +160,15 @@ def parse(data: dict) -> LandscapeSearchVectors:
     return LandscapeSearchVectors.model_validate(data)
 
 
+StatusCallback = Callable[[str, int, Optional[Dict[str, Any]]], Awaitable[None]]
+
+
 async def run(
-    uid: str,
+    _job_uid: str,
     client_uid: str,
     search_vectors: LandscapeSearchVectors,
     supabase_client,
-    status_cb,
+    status_cb: StatusCallback,
 ) -> Dict[str, Any]:
     """
     Execute the landscape generation (v1 scope):
@@ -172,22 +176,23 @@ async def run(
     - Seed CPC classes (exact match)
     - Vector search via export_embeddings HNSW index
     - Status updates throughout
+    `status_cb` should accept `(status: str, progress: int, extra: Optional[Dict[str, Any]])`.
     """
 
-    await status_cb(uid, "calculating", 5, {"_message": "Parsing search vectors"})
+    await status_cb("calculating", 5, {"_message": "Parsing search vectors"})
 
     seed_family_ids, k_hint = _collect_seed_family_ids(search_vectors, supabase_client)
     if not seed_family_ids:
         raise ValueError("No seed family IDs found from search vectors")
     seed_family_ids = sorted(set(seed_family_ids))
 
-    await status_cb(uid, "calculating", 15, {"_message": f"Found {len(seed_family_ids)} seed families"})
+    await status_cb("calculating", 15, {"_message": f"Found {len(seed_family_ids)} seed families"})
 
     k = k_hint or 200
-    await status_cb(uid, "calculating", 30, {"_message": f"Running NN search (k={k}) by seed id"})
+    await status_cb("calculating", 30, {"_message": f"Running NN search (k={k}) by seed id"})
     neighbors = await _neighbors_by_seeds(client_uid, supabase_client, seed_family_ids, k)
 
-    await status_cb(uid, "calculating", 55, {"_message": f"Aggregated {len(neighbors)} unique neighbors"})
+    await status_cb("calculating", 55, {"_message": f"Aggregated {len(neighbors)} unique neighbors"})
 
     # Include seeds as items as well
     seed_set: Set[int] = set(int(s) for s in seed_family_ids)
@@ -236,7 +241,7 @@ async def run(
             "is_seed": bool(fid in seed_set),
         })
 
-    await status_cb(uid, "calculating", 90, {"_message": "Assembled result payload"})
+    await status_cb("calculating", 90, {"_message": "Assembled result payload"})
 
     # Temporary compatibility: mirror items into `neighbors` for legacy UIs
     return {"v": 1, "items": items, "neighbors": items, "neighbor_count": len(items)}
@@ -300,28 +305,6 @@ def _query_family_ids_by_cpc_exact(supabase_client, codes: List[str]) -> Set[int
     return out
 
 
-async def _fetch_embeddings_for_families(supabase_client, family_ids: List[int]) -> List[List[float]]:
-    if not family_ids:
-        return []
-    embeddings: List[List[float]] = []
-    chunk_size = 1000
-    for i in range(0, len(family_ids), chunk_size):
-        chunk = family_ids[i:i + chunk_size]
-        def _do():
-            return (
-                supabase_client.table("export_embeddings")
-                .select("docdb_family_id, embedding")
-                .in_("docdb_family_id", chunk)
-                .execute()
-            )
-        resp = await _run_in_threadpool(_do)
-        for row in (resp.data or []):
-            vec = row.get("embedding")
-            if isinstance(vec, list) and vec:
-                embeddings.append(vec)
-    return embeddings
-
-
 async def _fetch_embeddings_map(supabase_client, family_ids: List[int]) -> Dict[int, List[float]]:
     if not family_ids:
         return {}
@@ -346,32 +329,6 @@ async def _fetch_embeddings_map(supabase_client, family_ids: List[int]) -> Dict[
             if vec is not None and len(vec) > 0:
                 out[int(fid)] = vec
     return out
-
-
-def _compute_centroid(vectors: List[List[float]]) -> Optional[List[float]]:
-    if not vectors:
-        return None
-    dim = len(vectors[0])
-    acc = [0.0] * dim
-    for v in vectors:
-        if len(v) != dim:
-            continue
-        for i in range(dim):
-            acc[i] += float(v[i])
-    n = len(vectors)
-    if n == 0:
-        return None
-    return [x / n for x in acc]
-
-
-async def _vector_search(supabase_client, query_embedding: List[float], k: int) -> List[Dict[str, Any]]:
-    def _do():
-        return supabase_client.rpc(
-            "match_export_embeddings",
-            {"query_embedding": query_embedding, "match_count": int(k)},
-        ).execute()
-    resp = await _run_in_threadpool(_do)
-    return resp.data or []
 
 
 async def _neighbors_by_seeds(
@@ -494,5 +451,8 @@ async def _fetch_family_metadata(supabase_client, family_ids: List[int]) -> List
 
 
 async def _run_in_threadpool(fn, *args, **kwargs):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
+    try:
+        return await asyncio.to_thread(fn, *args, **kwargs)  # type: ignore[attr-defined]
+    except AttributeError:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))

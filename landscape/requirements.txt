@@ -1,0 +1,7 @@
+numpy==2.3.3
+pydantic==2.11.9
+pytest==8.4.2
+python-dotenv==1.1.1
+realtime==2.20.0
+supabase==2.20.0
+umap-learn== 0.5.9.post2

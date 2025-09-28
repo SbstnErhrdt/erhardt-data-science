@@ -78,3 +78,12 @@ The worker writes `_status`, `_progress`, and `_message` to keep users informed:
 
 - Environment: `SUPABASE_URL`, `SUPABASE_KEY` for the worker.
 - Realtime channel/table: `ip_landscapes` (default).
+
+## Project Layout
+
+- `main.py` / `process.py` – worker entrypoint and pipeline logic.
+- `requirements.txt` – runtime dependencies for the worker.
+- `Dockerfile` – container definition building the worker image.
+- `Makefile` – convenience targets (e.g. `make test`).
+- `scripts/` – helper tooling such as `build_image.sh`.
+- `tests/` – integration tests (require Supabase credentials to run).

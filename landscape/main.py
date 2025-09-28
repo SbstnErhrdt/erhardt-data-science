@@ -3,7 +3,7 @@ import logging
 import os
 import signal
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Callable, Mapping, List
+from typing import Any, Awaitable, Callable, Dict, Mapping, Optional
 
 from dotenv import load_dotenv
 from realtime import AsyncRealtimeClient, RealtimePostgresChangesListenEvent
@@ -12,16 +12,19 @@ from supabase import create_client, client as supa_client
 from landscape import process
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Configuration & Logging
+# Logging configuration
 # ──────────────────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("ip_landscapes_worker")
 
-load_dotenv()  # load .env if present
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Settings & helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
@@ -32,184 +35,157 @@ class Settings:
     channel: str = "ip_landscapes"
 
     @staticmethod
-    def from_env() -> "Settings":
-        url = os.getenv("SUPABASE_URL")
-        key = os.getenv("SUPABASE_KEY")
-        if not url or not key:
-            missing = ["SUPABASE_URL" if not url else None, "SUPABASE_KEY" if not key else None]
-            missing = ", ".join(m for m in missing if m)
-            raise RuntimeError(f"Missing required environment variables: {missing}")
+    def from_env(env: Optional[Mapping[str, str]] = None) -> "Settings":
+        env = env or os.environ
+        url = env.get("SUPABASE_URL")
+        key = env.get("SUPABASE_KEY")
+        missing = [name for name, value in (("SUPABASE_URL", url), ("SUPABASE_KEY", key)) if not value]
+        if missing:
+            joined = ", ".join(missing)
+            raise RuntimeError(f"Missing required environment variables: {joined}")
         return Settings(supabase_url=url, supabase_key=key)
 
 
-SETTINGS = Settings.from_env()
+SupabaseClient = supa_client.Client
 
-# Global Supabase client (lightweight wrapper)
-supabase: supa_client = create_client(
-    supabase_url=SETTINGS.supabase_url,
-    supabase_key=SETTINGS.supabase_key,
-)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Database helpers
-# ──────────────────────────────────────────────────────────────────────────────
 
 async def _run_in_threadpool(fn: Callable, *args, **kwargs):
-    """Run a blocking SDK call in a default executor to avoid blocking the loop."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
-
-
-async def update_row(uid: str, fields: Mapping[str, Any]) -> bool:
-    """
-    Update a single row by uid with provided fields.
-    Returns True if any row was updated.
-    """
-
-    def _do_update():
-        return (
-            supabase.table(SETTINGS.table)
-            .update(dict(fields))
-            .eq("uid", uid)
-            .execute()
-        )
-
+    """Run blocking Supabase SDK calls without stalling the event loop."""
     try:
-        resp = await _run_in_threadpool(_do_update)
+        return await asyncio.to_thread(fn, *args, **kwargs)  # type: ignore[attr-defined]
+    except AttributeError:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
+
+
+class SupabaseService:
+    """Thin async wrapper around the Supabase Python client."""
+
+    def __init__(self, client: SupabaseClient, table: str):
+        self._client = client
+        self._table = table
+
+    @property
+    def client(self) -> SupabaseClient:
+        return self._client
+
+    async def update_row(self, uid: str, fields: Mapping[str, Any]) -> bool:
+        def _do_update():
+            return (
+                self._client.table(self._table)
+                .update(dict(fields))
+                .eq("uid", uid)
+                .execute()
+            )
+
+        try:
+            resp = await _run_in_threadpool(_do_update)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("Failed to update row uid=%s: %s", uid, exc)
+            return False
+
         updated = bool(resp.data)
         if updated:
             logger.info("Updated %s for uid=%s", list(fields.keys()), uid)
         else:
             logger.warning("No row updated for uid=%s (may not exist)", uid)
         return updated
-    except Exception as e:
-        logger.exception("Failed to update row uid=%s: %s", uid, e)
-        return False
+
+    async def send_status_update(
+            self,
+            uid: str,
+            status: str,
+            progress: int,
+            extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        payload: Dict[str, Any] = {"_status": status, "_progress": progress}
+        if extra:
+            payload.update(extra)
+        await self.update_row(uid, payload)
+
+    async def send_results(self, uid: str, result: Dict[str, Any]) -> None:
+        await self.send_status_update(uid, "done", 100, {"_output": result})
 
 
-async def send_status_update(uid: str, status: str, progress: int, extra: Optional[Dict[str, Any]] = None) -> None:
-    """
-    Update the process status/progress plus any extra fields.
-    """
-    payload: Dict[str, Any] = {"_status": status, "_progress": progress}
-    if extra:
-        payload.update(extra)
-    await update_row(uid, payload)
+class LandscapeJobProcessor:
+    """Validate and process incoming realtime payloads."""
 
+    def __init__(self, supabase_service: SupabaseService):
+        self._supabase = supabase_service
 
-async def send_results(uid: str, result: Dict[str, Any]) -> None:
-    """
-    Mark the job done and attach results in "_output".
-    """
-    await send_status_update(uid, "done", 100, {"_output": result})
+    async def __call__(self, payload: Mapping[str, Any]) -> None:
+        logger.debug("Received payload: %s", payload)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Realtime handling
-# ──────────────────────────────────────────────────────────────────────────────
-
-def _extract_uid(payload: Mapping[str, Any]) -> Optional[str]:
-    """
-    Defensive extraction of UID from the Realtime payload.
-    """
-    try:
-        return payload["data"]["record"]["uid"]
-    except Exception:
-        return None
-
-
-def _extract_record(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
-    try:
-        return payload["data"]["record"]
-    except Exception:
-        return None
-
-
-async def process_record(uid: str, record: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Core business logic for handling a record.
-    Validates input, delegates to process.run, and returns the result dict for `_output`.
-    """
-    if "search_vectors" not in record:
-        raise ValueError("Missing 'search_vectors' in record")
-
-    search_vectors = process.parse(record["search_vectors"])
-    client_uid = record.get("client_uid")
-    if not client_uid:
-        raise ValueError("Missing 'client_uid' in record")
-
-    async def _status(uid_: str, status: str, progress: int, extra: Optional[Dict[str, Any]] = None):
-        await send_status_update(uid_, status, progress, extra)
-
-    result = await process.run(uid, client_uid, search_vectors, supabase, _status)
-    return result
-
-
-
-def make_callback() -> Callable[[Dict[str, Any]], None]:
-    """
-    Wraps the async handler into a sync callback compatible with the realtime client.
-    """
-
-    def handle_callback(payload: Dict[str, Any]) -> None:
-        # Fire-and-forget: schedule async work on the running loop
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # If no loop, log and bail (shouldn't happen once started)
-            logger.error("No running event loop for callback; payload dropped")
+        uid = self._extract_uid(payload)
+        if not uid:
+            logger.error("Payload missing uid: %s", payload)
             return
 
-        loop.create_task(_handle_payload(payload))
+        record = self._extract_record(payload)
+        if not record:
+            logger.error("Payload missing record for uid=%s", uid)
+            await self._supabase.send_status_update(uid, "error", 100, {"_message": "Missing record"})
+            return
 
-    return handle_callback
+        try:
+            result = await self._process(uid, record)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Error processing uid=%s: %s", uid, exc)
+            await self._supabase.send_status_update(
+                uid,
+                "error",
+                100,
+                {"_message": str(exc)},
+            )
+            return
 
+        await self._supabase.send_results(uid, result)
 
-async def _handle_payload(payload: Dict[str, Any]) -> None:
-    logger.debug("Received payload: %s", payload)
+    async def _process(self, uid: str, record: Mapping[str, Any]) -> Dict[str, Any]:
+        if "search_vectors" not in record:
+            raise ValueError("Missing 'search_vectors' in record")
 
-    uid = _extract_uid(payload)
-    if not uid:
-        logger.error("Payload missing uid: %s", payload)
-        return
+        search_vectors = process.parse(record["search_vectors"])
+        client_uid = record.get("client_uid")
+        if not client_uid:
+            raise ValueError("Missing 'client_uid' in record")
 
-    record = _extract_record(payload)
-    if not record:
-        logger.error("Payload missing record for uid=%s", uid)
-        await send_status_update(uid, "error", 100)
-        return
+        async def _status(status: str, progress: int, extra: Optional[Dict[str, Any]] = None) -> None:
+            await self._supabase.send_status_update(uid, status, progress, extra)
 
-    try:
-        # Example: send an initial status if desired
-        # await send_status_update(uid, "processing", 5)
+        return await process.run(uid, client_uid, search_vectors, self._supabase.client, _status)
 
-        result = await process_record(uid, record)
-        await send_results(uid, result)
+    @staticmethod
+    def _extract_uid(payload: Mapping[str, Any]) -> Optional[str]:
+        try:
+            return payload["data"]["record"]["uid"]
+        except Exception:
+            return None
 
-    except Exception as e:
-        logger.exception("Error processing uid=%s: %s", uid, e)
-        await send_status_update(
-            uid,
-            "error",
-            100,
-            {
-                "_message": str(e)
-            }
-        )
+    @staticmethod
+    def _extract_record(payload: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+        try:
+            return payload["data"]["record"]
+        except Exception:
+            return None
 
 
 class RealtimeWorker:
-    """
-    Manages realtime connection, subscription, and lifecycle.
-    """
+    """Manage realtime connection, subscription, and graceful shutdown."""
 
-    def __init__(self, settings: Settings):
+    def __init__(
+            self,
+            settings: Settings,
+            processor: Callable[[Mapping[str, Any]], Awaitable[None]],
+    ) -> None:
         self.settings = settings
+        self._processor = processor
         self.client = AsyncRealtimeClient(
             f"{settings.supabase_url}/realtime/v1",
             settings.supabase_key,
-            auto_reconnect=True,  # let the client try to reconnect automatically
+            auto_reconnect=True,
         )
         self._stop_event = asyncio.Event()
         self._channel = None
@@ -225,17 +201,10 @@ class RealtimeWorker:
             schema="public",
             table=self.settings.table,
             filter="_status=eq.to_calculate",
-            callback=make_callback(),
+            callback=self._wrap_callback(self._processor),
         ).subscribe()
 
         logger.info("Subscribed to %s (filter: _status=eq.to_calculate)", self.settings.table)
-
-        # NOTE:
-        # If your client warns that `.listen()` is deprecated, you can:
-        #   1) Use a simple wait loop on an Event to keep the task alive, OR
-        #   2) If the library offers a replacement (e.g., `.run()`), use that.
-        #
-        # We'll keep the task alive with an Event to avoid relying on deprecated APIs.
         await self._stop_event.wait()
 
     async def stop(self) -> None:
@@ -244,43 +213,65 @@ class RealtimeWorker:
         try:
             if self._channel:
                 await self._channel.unsubscribe()
-        except Exception as e:
-            logger.warning("Error unsubscribing channel: %s", e)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Error unsubscribing channel: %s", exc)
         try:
             await self.client.disconnect()
-        except Exception as e:
-            logger.warning("Error disconnecting realtime client: %s", e)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Error disconnecting realtime client: %s", exc)
         logger.info("Shutdown complete")
+
+    @staticmethod
+    def _wrap_callback(
+            handler: Callable[[Mapping[str, Any]], Awaitable[None]]
+    ) -> Callable[[Mapping[str, Any]], None]:
+        def _callback(payload: Mapping[str, Any]) -> None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                logger.error("No running event loop for callback; payload dropped")
+                return
+            loop.create_task(handler(payload))
+
+        return _callback
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def main() -> None:
-    worker = RealtimeWorker(SETTINGS)
+
+def _create_worker(settings: Settings) -> RealtimeWorker:
+    client = create_client(settings.supabase_url, settings.supabase_key)
+    service = SupabaseService(client, settings.table)
+    processor = LandscapeJobProcessor(service)
+    return RealtimeWorker(settings, processor)
+
+
+async def main(settings: Optional[Settings] = None) -> None:
+    if settings is None:
+        load_dotenv()
+        settings = Settings.from_env()
+
+    worker = _create_worker(settings)
 
     loop = asyncio.get_running_loop()
     stop_signals = (signal.SIGINT, signal.SIGTERM)
 
-    def _handle_sig():
+    def _handle_sig() -> None:
         asyncio.create_task(worker.stop())
 
     for sig in stop_signals:
         try:
             loop.add_signal_handler(sig, _handle_sig)
-        except NotImplementedError:
-            # Signal handling may not be available on some platforms (e.g., Windows)
+        except NotImplementedError:  # pragma: no cover - platform guard
             pass
 
-    # Start and run until stopped
     await worker.start()
 
 
 if __name__ == "__main__":
-    # Prefer asyncio.run for modern, clean event loop management
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        # Graceful exit on Ctrl+C
         pass
