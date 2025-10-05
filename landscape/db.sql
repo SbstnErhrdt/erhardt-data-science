@@ -206,7 +206,17 @@ grant delete, insert, references, select, trigger, truncate, update on ip_patent
 
 
 create or replace function nn_ip_patent_family_search_by_id(c_uid uuid, p_id integer, k integer DEFAULT 10)
-    returns TABLE(patent_family_id text, title text, abstract text, family_authorities character varying[], first_application_pub_date date, similarity double precision, sonar_is_active boolean, lists json[])
+    returns TABLE
+            (
+                patent_family_id           text,
+                title                      text,
+                abstract                   text,
+                family_authorities         varchar[],
+                first_application_pub_date date,
+                similarity                 double precision,
+                sonar_is_active            boolean,
+                lists                      json[]
+            )
     language plpgsql
 as
 $$
@@ -225,12 +235,14 @@ BEGIN
     PERFORM set_config('hnsw.ef_search', GREATEST(k, 24)::text, true);
 
     RETURN QUERY
-        with q as (SELECT e.docdb_family_id,
-                          1 - (e.embedding <=> q) AS cosine_similarity -- now types match
-                   FROM export_embeddings AS e
-                   WHERE e.docdb_family_id <> p_id
-                   ORDER BY e.embedding <=> q
-                   LIMIT k),
+        with q as (
+            SELECT e.docdb_family_id,
+                   1 - (e.embedding <=> q) AS cosine_similarity -- similarity in [0,1]
+            FROM export_embeddings AS e
+            WHERE e.docdb_family_id <> p_id
+            ORDER BY e.embedding <=> q
+            LIMIT GREATEST(k * 5, 100) -- over-fetch to compensate for missing metadata joins
+        ),
              client_sonar AS (SELECT s.patent_family_id,
                                      s.client_uid,
                                      s.uid as sonar_uid,
@@ -250,18 +262,20 @@ BEGIN
                                             left join patent_lists as l on l.uid = i.list_uid
                                    where i.client_uid = c_uid
                                    group by i.patent_family_id)
-        SELECT f.family_id                                                as patent_family_id,
-               f.title::text                                              as title,
-               f.abstract                                                 as abstract,
-               f.family_authorities                                       as family_authorities,
-               f.first_application_pub_date                               as first_application_pub_date,
-               round(q.cosine_similarity::numeric, 4)::double precision   as similarity,
-               CASE WHEN c.sonar_uid IS NOT NULL THEN true ELSE false END as sonar_is_active,
-               pli.lists                                                  as lists
-        from ip_patent_families as f
-                 JOIN q ON f.family_id = q.docdb_family_id::text
-                 LEFT JOIN client_sonar as c ON c.patent_family_id = f.family_id
-                 LEFT JOIN patent_list_items as pli ON pli.patent_family_id = f.family_id;
+        SELECT coalesce(f.family_id, q.docdb_family_id::text)               as patent_family_id,
+               f.title::text                                                as title,
+               f.abstract                                                   as abstract,
+               f.family_authorities                                         as family_authorities,
+               f.first_application_pub_date                                 as first_application_pub_date,
+               round(q.cosine_similarity::numeric, 4)::double precision     as similarity,
+               CASE WHEN c.sonar_uid IS NOT NULL THEN true ELSE false END   as sonar_is_active,
+               pli.lists                                                    as lists
+        from q
+                 LEFT JOIN ip_patent_families as f ON f.family_id = q.docdb_family_id::text
+                 LEFT JOIN client_sonar as c ON c.patent_family_id = coalesce(f.family_id, q.docdb_family_id::text)
+                 LEFT JOIN patent_list_items as pli ON pli.patent_family_id = coalesce(f.family_id, q.docdb_family_id::text)
+        ORDER BY similarity desc
+        LIMIT k;
 END
 $$;
 
