@@ -1,0 +1,12 @@
+networks:
+  supabase_supabase:
+    external: true
+
+services:
+    patent-landscape-worker:
+        image: registry.erhardt.net/erhardt-patent-landscape-worker
+        environment:
+          - SUPABASE_URL=${SUPABASE_URL}
+          - SUPABASE_KEY=${SUPABASE_KEY}
+        networks:
+        - supabase_supabase

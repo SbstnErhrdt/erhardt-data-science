@@ -6,3 +6,4 @@ node_modules
 *.csv
 *.ipynb
 __pycache__/
+landscape/.pw-docker-registry

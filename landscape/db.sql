@@ -205,7 +205,7 @@ grant delete, insert, references, select, trigger, truncate, update on ip_patent
 grant delete, insert, references, select, trigger, truncate, update on ip_patent_families to service_role;
 
 
-create function nn_ip_patent_family_search_by_id(c_uid uuid, p_id integer, k integer DEFAULT 10)
+create or replace function nn_ip_patent_family_search_by_id(c_uid uuid, p_id integer, k integer DEFAULT 10)
     returns TABLE(patent_family_id text, title text, abstract text, family_authorities character varying[], first_application_pub_date date, similarity double precision, sonar_is_active boolean, lists json[])
     language plpgsql
 as
@@ -222,7 +222,7 @@ BEGIN
         RAISE EXCEPTION 'No embedding for family_id=%', p_id;
     END IF;
 
-    PERFORM set_config('hnsw.ef_search', '24', true);
+    PERFORM set_config('hnsw.ef_search', GREATEST(k, 24)::text, true);
 
     RETURN QUERY
         with q as (SELECT e.docdb_family_id,
@@ -272,4 +272,7 @@ grant execute on function nn_ip_patent_family_search_by_id(uuid, integer, intege
 grant execute on function nn_ip_patent_family_search_by_id(uuid, integer, integer) to authenticated;
 
 grant execute on function nn_ip_patent_family_search_by_id(uuid, integer, integer) to service_role;
+
+SELECT nn_ip_patent_family_search_by_id('ea1a588c-378d-4d0a-817a-555439080997', 37420969, 200);
+
 
