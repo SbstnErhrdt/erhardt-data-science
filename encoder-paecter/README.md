@@ -449,5 +449,39 @@ $$;
 alter function normalize_applicant_name(text) owner to postgres;
 ```
 
-Write a python cron job to generate the embeddings for all missing embeddings of patent families and store them in the export_embeddings table.
-Make use of an env file with the database connection parameters.
+## Cron job
+
+The `cron.py` script generates PAECTER embeddings for patent families that do not
+yet exist in the `export_embeddings` table. The script can be executed from a
+cron entry (or any scheduler) and will process the pending families in batches.
+
+### Configuration
+
+Copy the provided example environment file and fill in the database connection
+details:
+
+```bash
+cp .env.example .env
+```
+
+The script reads the following variables:
+
+| Variable | Description |
+| --- | --- |
+| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | PostgreSQL connection settings. |
+| `DATABASE_URL` | Optional full connection string that overrides the individual settings. |
+| `PAECTER_FETCH_LIMIT` | Number of families to fetch per run (default: 256). |
+| `PAECTER_BATCH_SIZE` | Batch size for encoding (default: 16). |
+| `PAECTER_MAX_LENGTH` | Maximum token length when encoding (default: 512). |
+
+Alternatively, set `PAECTER_ENV_FILE` to point to a different `.env` file.
+
+### Running manually
+
+```bash
+python cron.py
+```
+
+The script connects to the database, fetches families missing embeddings,
+generates vectors with the PAECTER model, and stores them in
+`export_embeddings`.
