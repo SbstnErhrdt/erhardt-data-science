@@ -62,7 +62,7 @@ def get_database_dsn() -> str:
     if (url := os.getenv("DATABASE_URL")):
         return url
 
-    required_keys = ["DB_HOST", "DB_PORT", "DB_NAME", "DB_USER", "DB_PASSWORD"]
+    required_keys = ["SQL_HOST", "SQL_PORT", "SQL_DATABASE", "SQL_USER", "SQL_PASSWORD"]
     missing = [key for key in required_keys if not os.getenv(key)]
     if missing:
         raise RuntimeError(
@@ -70,11 +70,11 @@ def get_database_dsn() -> str:
         )
 
     return (
-        f"host={os.environ['DB_HOST']} "
-        f"port={os.environ['DB_PORT']} "
-        f"dbname={os.environ['DB_NAME']} "
-        f"user={os.environ['DB_USER']} "
-        f"password={os.environ['DB_PASSWORD']}"
+        f"host={os.environ['SQL_HOST']} "
+        f"port={os.environ['SQL_PORT']} "
+        f"dbname={os.environ['SQL_DATABASE']} "
+        f"user={os.environ['SQL_USER']} "
+        f"password={os.environ['SQL_PASSWORD']}"
     )
 
 
@@ -86,8 +86,7 @@ def fetch_pending_patent_families(cursor, limit: int) -> List[PatentFamily]:
                    title,
                    abstract
             FROM epo_doc_db.mv_patent_family
-            WHERE family_id ~ '^[0-9]+$'
-              AND title IS NOT NULL
+            WHERE title IS NOT NULL
               AND btrim(title) <> ''
               AND abstract IS NOT NULL
               AND btrim(abstract) <> ''
@@ -149,8 +148,7 @@ def insert_embeddings(cursor, families: Sequence[PatentFamily], embeddings: Sequ
         """
         INSERT INTO export_embeddings (docdb_family_id, embedding)
         VALUES %s
-        ON CONFLICT (docdb_family_id)
-        DO UPDATE SET embedding = EXCLUDED.embedding
+            ON CONFLICT (docdb_family_id) DO UPDATE SET embedding = EXCLUDED.embedding
         """,
         records,
     )

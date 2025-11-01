@@ -468,7 +468,7 @@ The script reads the following variables:
 
 | Variable | Description |
 | --- | --- |
-| `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` | PostgreSQL connection settings. |
+| `SQL_HOST`, `SQL_PORT`, `SQL_DATABASE`, `SQL_USER`, `SQL_PASSWORD` | PostgreSQL connection settings. |
 | `DATABASE_URL` | Optional full connection string that overrides the individual settings. |
 | `PAECTER_FETCH_LIMIT` | Number of families to fetch per run (default: 256). |
 | `PAECTER_BATCH_SIZE` | Batch size for encoding (default: 16). |
@@ -485,3 +485,16 @@ python cron.py
 The script connects to the database, fetches families missing embeddings,
 generates vectors with the PAECTER model, and stores them in
 `export_embeddings`.
+
+### Running with Docker
+
+Build the image from the repository root and run it with the required database
+environment variables (or an env file):
+
+```bash
+docker build -f encoder-paecter/Dockerfile -t encoder-paecter .
+docker run --rm --env-file encoder-paecter/.env encoder-paecter
+```
+
+When using a different location for your configuration, update the `--env-file`
+path or pass the variables via repeated `-e KEY=value` arguments.
