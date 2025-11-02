@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from itertools import chain
 from pathlib import Path
@@ -247,64 +248,146 @@ def main() -> None:
 
     LOGGER.info("Connecting to database")
     dsn = get_database_dsn()
-    total_processed = 0
+    grand_total = 0
+    chunk_counter = 0
+    iteration_index = 0
+    tokenizer: Optional[AutoTokenizer] = None
+    model: Optional[AutoModel] = None
+    device: Optional[torch.device] = None
     try:
         with psycopg2.connect(dsn) as conn:
             LOGGER.info("Database connection established")
-            LOGGER.info(
-                "Starting background fetcher (limit %d, batch size %d)",
-                fetch_limit,
-                batch_size,
-            )
-            with PendingFamilyStream(dsn, fetch_limit, batch_size) as stream:
-                iterator = iter(stream)
-                query_start = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
-                query_end = torch.cuda.Event(enable_timing=True) if query_start else None
-                cpu_query_start = torch.cuda.Event(enable_timing=False) if query_start else None
-                try:
-                    first_chunk = next(iterator)
-                except StopIteration:
-                    LOGGER.info("No pending patent families found. Nothing to do.")
-                    return
+            while True:
+                iteration_index += 1
+                iteration_processed = 0
+                no_more_pending = False
 
                 LOGGER.info(
-                    "Pending families detected (initial chunk size: %d); loading encoder",
-                    len(first_chunk),
+                    "Iteration %d: starting background fetcher (limit %d, batch size %d)",
+                    iteration_index,
+                    fetch_limit,
+                    batch_size,
                 )
 
-                tokenizer = AutoTokenizer.from_pretrained("mpi-inno-comp/paecter")
-                model = AutoModel.from_pretrained("mpi-inno-comp/paecter")
-                model.eval()
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                model.to(device)
-                LOGGER.info("Encoder ready; using device: %s", device)
+                with PendingFamilyStream(dsn, fetch_limit, batch_size) as stream:
+                    iterator = iter(stream)
+                    fetch_start = time.perf_counter()
+                    try:
+                        first_chunk = next(iterator)
+                    except StopIteration:
+                        if grand_total == 0:
+                            LOGGER.info("No pending patent families found. Nothing to do.")
+                        else:
+                            LOGGER.info("No additional families found; stopping after iteration %d.", iteration_index)
+                        no_more_pending = True
+                    else:
+                        first_fetch_duration = time.perf_counter() - fetch_start
+                        LOGGER.info(
+                            "Iteration %d: first chunk contains %d families fetched in %.2fs",
+                            iteration_index,
+                            len(first_chunk),
+                            first_fetch_duration,
+                        )
 
-                all_chunks = chain([first_chunk], iterator)
-                with conn.cursor() as cursor:
-                    for index, chunk in enumerate(all_chunks, start=1):
-                        if not chunk:
-                            continue
-                        LOGGER.info(
-                            "Encoding chunk %d with %d families (IDs %s-%s)",
-                            index,
-                            len(chunk),
-                            chunk[0].family_id,
-                            chunk[-1].family_id,
-                        )
-                        embeddings = encode_families(chunk, tokenizer, model, device, max_length)
-                        insert_embeddings(cursor, chunk, embeddings)
-                        conn.commit()
-                        total_processed += len(chunk)
-                        LOGGER.info(
-                            "Stored embeddings for chunk %d (processed %d families so far)",
-                            index,
-                            total_processed,
-                        )
+                        if tokenizer is None or model is None or device is None:
+                            encoder_load_start = time.perf_counter()
+                            tokenizer = AutoTokenizer.from_pretrained("mpi-inno-comp/paecter")
+                            model = AutoModel.from_pretrained("mpi-inno-comp/paecter")
+                            model.eval()
+                            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                            model.to(device)
+                            encoder_load_duration = time.perf_counter() - encoder_load_start
+                            LOGGER.info(
+                                "Encoder loaded on %s in %.2fs",
+                                device,
+                                encoder_load_duration,
+                            )
+                        else:
+                            LOGGER.info("Encoder already loaded on %s; reusing.", device)
+
+                        fetch_start = time.perf_counter()
+                        all_chunks = chain([first_chunk], iterator)
+                        with conn.cursor() as cursor:
+                            for local_index, chunk in enumerate(all_chunks, start=1):
+                                if not chunk:
+                                    fetch_start = time.perf_counter()
+                                    continue
+
+                                fetch_duration = (
+                                    first_fetch_duration
+                                    if (iteration_processed == 0 and local_index == 1)
+                                    else time.perf_counter() - fetch_start
+                                )
+                                global_chunk_number = chunk_counter + 1
+                                LOGGER.info(
+                                    (
+                                        "Iteration %d, chunk %d (global %d): %d families "
+                                        "(IDs %s-%s) ready after %.2fs fetch wait"
+                                    ),
+                                    iteration_index,
+                                    local_index,
+                                    global_chunk_number,
+                                    len(chunk),
+                                    chunk[0].family_id,
+                                    chunk[-1].family_id,
+                                    fetch_duration,
+                                )
+
+                                encode_start = time.perf_counter()
+                                embeddings = encode_families(chunk, tokenizer, model, device, max_length)
+                                encode_duration = time.perf_counter() - encode_start
+
+                                db_start = time.perf_counter()
+                                insert_embeddings(cursor, chunk, embeddings)
+                                conn.commit()
+                                db_duration = time.perf_counter() - db_start
+
+                                iteration_processed += len(chunk)
+                                chunk_counter += 1
+                                grand_total += len(chunk)
+
+                                LOGGER.info(
+                                    (
+                                        "Iteration %d, chunk %d (global %d) stored: encode %.2fs, "
+                                        "store %.2fs (iteration total %d, cumulative %d)"
+                                    ),
+                                    iteration_index,
+                                    local_index,
+                                    global_chunk_number,
+                                    encode_duration,
+                                    db_duration,
+                                    iteration_processed,
+                                    grand_total,
+                                )
+
+                                fetch_start = time.perf_counter()
+
+                if no_more_pending:
+                    break
+
+                if iteration_processed == 0:
+                    LOGGER.info("Iteration %d yielded no families; stopping.", iteration_index)
+                    break
+
+                LOGGER.info(
+                    "Iteration %d completed; processed %d families (cumulative %d).",
+                    iteration_index,
+                    iteration_processed,
+                    grand_total,
+                )
+
+                if iteration_processed < fetch_limit:
+                    LOGGER.info(
+                        "Iteration %d processed fewer than fetch limit (%d); assuming queue drained.",
+                        iteration_index,
+                        fetch_limit,
+                    )
+                    break
     except Exception:
         LOGGER.exception("Embedding generation failed")
         raise
 
-    LOGGER.info("Embedding generation finished; processed %d families.", total_processed)
+    LOGGER.info("Embedding generation finished; processed %d families in total.", grand_total)
 
 
 if __name__ == "__main__":
