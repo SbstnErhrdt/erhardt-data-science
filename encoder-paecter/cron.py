@@ -259,11 +259,7 @@ def main() -> None:
     model: Optional[AutoModel] = None
     device: Optional[torch.device] = None
     try:
-        LOGGER.info("Testing database connectivity")
-        with psycopg2.connect(dsn) as test_conn:
-            test_conn.close()
-        LOGGER.info("Database connection established")
-
+        LOGGER.info("Starting embedding loop with fetch limit %d and batch size %d", fetch_limit, batch_size)
         while True:
             iteration_index += 1
             iteration_processed = 0
