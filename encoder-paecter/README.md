@@ -493,11 +493,21 @@ environment variables (or an env file):
 
 ```bash
 docker build -f encoder-paecter/Dockerfile -t encoder-paecter .
-docker run --rm --env-file encoder-paecter/.env encoder-paecter
+docker run --rm --gpus all --env-file encoder-paecter/.env encoder-paecter
 ```
 
 When using a different location for your configuration, update the `--env-file`
 path or pass the variables via repeated `-e KEY=value` arguments.
+
+The Docker image is based on an NVIDIA CUDA runtime. On hosts without GPUs you
+can still build the image by overriding the PyTorch wheel:
+
+```bash
+docker build \
+  -f encoder-paecter/Dockerfile \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu \
+  -t encoder-paecter-cpu .
+```
 
 ### Database indexes
 
@@ -507,3 +517,15 @@ supporting indexes once:
 ```bash
 psql -f encoder-paecter/sql/create_embeddings_indexes.sql
 ```
+
+### Deployment
+
+Automated builds and rollout mirror the `landscape` project. From the repository
+root run:
+
+```bash
+./encoder-paecter/deploy.sh
+```
+
+This script pushes a CUDA-enabled image to `registry.erhardt.net` (amd64 only)
+and triggers the remote deployment at `/home/docker-compose/encoder-paecter`.
