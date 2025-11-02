@@ -143,12 +143,12 @@ def insert_embeddings(cursor, families: Sequence[PatentFamily], embeddings: Sequ
     records: List[Tuple[int, List[float]]] = [
         (family.family_id, embedding.tolist()) for family, embedding in zip(families, embeddings)
     ]
+    LOGGER.info("Inserting embeddings for %d families", len(records))
     execute_values(
         cursor,
         """
         INSERT INTO export_embeddings (docdb_family_id, embedding)
         VALUES %s
-            ON CONFLICT (docdb_family_id) DO UPDATE SET embedding = EXCLUDED.embedding
         """,
         records,
     )
@@ -159,6 +159,7 @@ def main() -> None:
 
     root_dir = Path(__file__).resolve().parent
     env_path = Path(os.getenv("PAECTER_ENV_FILE", root_dir / ".env"))
+    LOGGER.info("Loading environment variables from %s", env_path)
     load_env_file(Path(env_path))
 
     fetch_limit = int(os.getenv("PAECTER_FETCH_LIMIT", "256"))
@@ -169,26 +170,41 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained("mpi-inno-comp/paecter")
     model = AutoModel.from_pretrained("mpi-inno-comp/paecter")
     model.eval()
+    LOGGER.info("Model loaded; using device resolution in later steps")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
+    LOGGER.info("Using device: %s", device)
 
     LOGGER.info("Connecting to database")
     dsn = get_database_dsn()
-    with psycopg2.connect(dsn) as conn:
-        with conn.cursor() as cursor:
-            families = fetch_pending_patent_families(cursor, fetch_limit)
-            if not families:
-                LOGGER.info("No pending patent families found. Nothing to do.")
-                return
+    try:
+        with psycopg2.connect(dsn) as conn:
+            LOGGER.info("Database connection established")
+            with conn.cursor() as cursor:
+                LOGGER.info("Fetching up to %d families missing embeddings", fetch_limit)
+                families = fetch_pending_patent_families(cursor, fetch_limit)
+                if not families:
+                    LOGGER.info("No pending patent families found. Nothing to do.")
+                    return
 
-            LOGGER.info("Fetched %d pending patent families", len(families))
+                LOGGER.info("Fetched %d pending patent families", len(families))
 
-            for chunk in _chunked(families, batch_size):
-                embeddings = encode_families(chunk, tokenizer, model, device, max_length)
-                insert_embeddings(cursor, chunk, embeddings)
-                conn.commit()
-                LOGGER.info("Stored embeddings for %d families", len(chunk))
+                for index, chunk in enumerate(_chunked(families, batch_size), start=1):
+                    LOGGER.info(
+                        "Encoding chunk %d with %d families (IDs %s-%s)",
+                        index,
+                        len(chunk),
+                        chunk[0].family_id,
+                        chunk[-1].family_id,
+                    )
+                    embeddings = encode_families(chunk, tokenizer, model, device, max_length)
+                    insert_embeddings(cursor, chunk, embeddings)
+                    conn.commit()
+                    LOGGER.info("Stored embeddings for chunk %d", index)
+    except Exception:
+        LOGGER.exception("Embedding generation failed")
+        raise
 
     LOGGER.info("Embedding generation finished")
 
