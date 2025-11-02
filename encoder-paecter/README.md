@@ -498,3 +498,12 @@ docker run --rm --env-file encoder-paecter/.env encoder-paecter
 
 When using a different location for your configuration, update the `--env-file`
 path or pass the variables via repeated `-e KEY=value` arguments.
+
+### Database indexes
+
+For best performance when locating families without embeddings, create the
+supporting indexes once:
+
+```bash
+psql -f encoder-paecter/sql/create_embeddings_indexes.sql
+```

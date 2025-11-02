@@ -81,12 +81,13 @@ def get_database_dsn() -> str:
 def fetch_pending_patent_families(cursor, limit: int) -> List[PatentFamily]:
     cursor.execute(
         """
-        WITH families AS (
+        WITH filtered AS (
             SELECT family_id::bigint AS family_id,
                    title,
                    abstract
             FROM epo_doc_db.mv_patent_family
-            WHERE title IS NOT NULL
+            WHERE family_id ~ '^[0-9]+$'
+              AND title IS NOT NULL
               AND btrim(title) <> ''
               AND abstract IS NOT NULL
               AND btrim(abstract) <> ''
@@ -94,9 +95,12 @@ def fetch_pending_patent_families(cursor, limit: int) -> List[PatentFamily]:
         SELECT f.family_id,
                f.title,
                f.abstract
-        FROM families f
-        LEFT JOIN export_embeddings e ON e.docdb_family_id = f.family_id
-        WHERE e.docdb_family_id IS NULL
+        FROM filtered f
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM export_embeddings e
+            WHERE e.docdb_family_id = f.family_id
+        )
         ORDER BY f.family_id
         LIMIT %s
         """,
@@ -166,30 +170,29 @@ def main() -> None:
     batch_size = int(os.getenv("PAECTER_BATCH_SIZE", "16"))
     max_length = int(os.getenv("PAECTER_MAX_LENGTH", "512"))
 
-    LOGGER.info("Loading tokenizer and model mpi-inno-comp/paecter")
-    tokenizer = AutoTokenizer.from_pretrained("mpi-inno-comp/paecter")
-    model = AutoModel.from_pretrained("mpi-inno-comp/paecter")
-    model.eval()
-    LOGGER.info("Model loaded; using device resolution in later steps")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    LOGGER.info("Using device: %s", device)
-
     LOGGER.info("Connecting to database")
     dsn = get_database_dsn()
     try:
         with psycopg2.connect(dsn) as conn:
             LOGGER.info("Database connection established")
+            LOGGER.info("Checking for pending families (limit %d)", fetch_limit)
             with conn.cursor() as cursor:
-                LOGGER.info("Fetching up to %d families missing embeddings", fetch_limit)
                 families = fetch_pending_patent_families(cursor, fetch_limit)
-                if not families:
-                    LOGGER.info("No pending patent families found. Nothing to do.")
-                    return
 
-                LOGGER.info("Fetched %d pending patent families", len(families))
+            if not families:
+                LOGGER.info("No pending patent families found. Nothing to do.")
+                return
 
+            LOGGER.info("Found %d pending patent families; loading encoder", len(families))
+
+            tokenizer = AutoTokenizer.from_pretrained("mpi-inno-comp/paecter")
+            model = AutoModel.from_pretrained("mpi-inno-comp/paecter")
+            model.eval()
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            model.to(device)
+            LOGGER.info("Encoder ready; using device: %s", device)
+
+            with conn.cursor() as cursor:
                 for index, chunk in enumerate(_chunked(families, batch_size), start=1):
                     LOGGER.info(
                         "Encoding chunk %d with %d families (IDs %s-%s)",
