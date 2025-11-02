@@ -473,6 +473,8 @@ The script reads the following variables:
 | `PAECTER_FETCH_LIMIT` | Number of families to fetch per run (default: 256). |
 | `PAECTER_BATCH_SIZE` | Batch size for encoding (default: 16). |
 | `PAECTER_MAX_LENGTH` | Maximum token length when encoding (default: 512). |
+| `PAECTER_DB_WRITE_RETRIES` | Maximum retries when a database write fails (default: 5). |
+| `PAECTER_DB_WRITE_BACKOFF` | Exponential backoff base (seconds) for database retries (default: 2.0). |
 
 Alternatively, set `PAECTER_ENV_FILE` to point to a different `.env` file.
 

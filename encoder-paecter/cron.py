@@ -102,6 +102,9 @@ ORDER BY f.family_id
 LIMIT %s
 """
 
+DB_WRITE_MAX_RETRIES = int(os.getenv("PAECTER_DB_WRITE_RETRIES", "5"))
+DB_WRITE_RETRY_BACKOFF = float(os.getenv("PAECTER_DB_WRITE_BACKOFF", "2.0"))
+
 
 class PendingFamilyStream:
     """Background prefetcher that streams patent families awaiting embeddings."""
@@ -248,6 +251,7 @@ def main() -> None:
 
     LOGGER.info("Connecting to database")
     dsn = get_database_dsn()
+    write_conn: Optional[psycopg2.extensions.connection] = None
     grand_total = 0
     chunk_counter = 0
     iteration_index = 0
@@ -255,137 +259,170 @@ def main() -> None:
     model: Optional[AutoModel] = None
     device: Optional[torch.device] = None
     try:
-        with psycopg2.connect(dsn) as conn:
-            LOGGER.info("Database connection established")
-            while True:
-                iteration_index += 1
-                iteration_processed = 0
-                no_more_pending = False
+        LOGGER.info("Testing database connectivity")
+        with psycopg2.connect(dsn) as test_conn:
+            test_conn.close()
+        LOGGER.info("Database connection established")
 
-                LOGGER.info(
-                    "Iteration %d: starting background fetcher (limit %d, batch size %d)",
-                    iteration_index,
-                    fetch_limit,
-                    batch_size,
-                )
+        while True:
+            iteration_index += 1
+            iteration_processed = 0
+            no_more_pending = False
 
-                with PendingFamilyStream(dsn, fetch_limit, batch_size) as stream:
-                    iterator = iter(stream)
-                    fetch_start = time.perf_counter()
-                    try:
-                        first_chunk = next(iterator)
-                    except StopIteration:
-                        if grand_total == 0:
-                            LOGGER.info("No pending patent families found. Nothing to do.")
-                        else:
-                            LOGGER.info("No additional families found; stopping after iteration %d.", iteration_index)
-                        no_more_pending = True
+            LOGGER.info(
+                "Iteration %d: starting background fetcher (limit %d, batch size %d)",
+                iteration_index,
+                fetch_limit,
+                batch_size,
+            )
+
+            with PendingFamilyStream(dsn, fetch_limit, batch_size) as stream:
+                iterator = iter(stream)
+                fetch_start = time.perf_counter()
+
+                try:
+                    first_chunk = next(iterator)
+                except StopIteration:
+                    if grand_total == 0:
+                        LOGGER.info("No pending patent families found. Nothing to do.")
                     else:
-                        first_fetch_duration = time.perf_counter() - fetch_start
+                        LOGGER.info("No additional families found; stopping after iteration %d.", iteration_index)
+                    no_more_pending = True
+                else:
+                    first_fetch_duration = time.perf_counter() - fetch_start
+                    LOGGER.info(
+                        "Iteration %d: first chunk contains %d families fetched in %.2fs",
+                        iteration_index,
+                        len(first_chunk),
+                        first_fetch_duration,
+                    )
+
+                    if tokenizer is None or model is None or device is None:
+                        encoder_load_start = time.perf_counter()
+                        tokenizer = AutoTokenizer.from_pretrained("mpi-inno-comp/paecter")
+                        model = AutoModel.from_pretrained("mpi-inno-comp/paecter")
+                        model.eval()
+                        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                        model.to(device)
+                        encoder_load_duration = time.perf_counter() - encoder_load_start
+                        LOGGER.info("Encoder loaded on %s in %.2fs", device, encoder_load_duration)
+                    else:
+                        LOGGER.info("Encoder already loaded on %s; reusing.", device)
+
+                    fetch_start = time.perf_counter()
+                    all_chunks = chain([first_chunk], iterator)
+
+                    for local_index, chunk in enumerate(all_chunks, start=1):
+                        if not chunk:
+                            fetch_start = time.perf_counter()
+                            continue
+
+                        fetch_duration = (
+                            first_fetch_duration
+                            if (iteration_processed == 0 and local_index == 1)
+                            else time.perf_counter() - fetch_start
+                        )
+                        global_chunk_number = chunk_counter + 1
                         LOGGER.info(
-                            "Iteration %d: first chunk contains %d families fetched in %.2fs",
+                            (
+                                "Iteration %d, chunk %d (global %d): %d families "
+                                "(IDs %s-%s) ready after %.2fs fetch wait"
+                            ),
                             iteration_index,
-                            len(first_chunk),
-                            first_fetch_duration,
+                            local_index,
+                            global_chunk_number,
+                            len(chunk),
+                            chunk[0].family_id,
+                            chunk[-1].family_id,
+                            fetch_duration,
                         )
 
-                        if tokenizer is None or model is None or device is None:
-                            encoder_load_start = time.perf_counter()
-                            tokenizer = AutoTokenizer.from_pretrained("mpi-inno-comp/paecter")
-                            model = AutoModel.from_pretrained("mpi-inno-comp/paecter")
-                            model.eval()
-                            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                            model.to(device)
-                            encoder_load_duration = time.perf_counter() - encoder_load_start
-                            LOGGER.info(
-                                "Encoder loaded on %s in %.2fs",
-                                device,
-                                encoder_load_duration,
-                            )
+                        encode_start = time.perf_counter()
+                        embeddings = encode_families(chunk, tokenizer, model, device, max_length)
+                        encode_duration = time.perf_counter() - encode_start
+
+                        db_start = time.perf_counter()
+                        for attempt in range(1, DB_WRITE_MAX_RETRIES + 1):
+                            try:
+                                if write_conn is None or getattr(write_conn, "closed", 0):
+                                    write_conn = psycopg2.connect(dsn)
+                                    LOGGER.info(
+                                        "Write connection (re)established on attempt %d",
+                                        attempt,
+                                    )
+                                with write_conn.cursor() as cursor:
+                                    insert_embeddings(cursor, chunk, embeddings)
+                                write_conn.commit()
+                                break
+                            except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+                                LOGGER.warning(
+                                    "Database write failed on attempt %d/%d: %s",
+                                    attempt,
+                                    DB_WRITE_MAX_RETRIES,
+                                    exc,
+                                )
+                                if write_conn and not getattr(write_conn, "closed", 0):
+                                    try:
+                                        write_conn.close()
+                                    except Exception:
+                                        LOGGER.debug("Error closing write connection after failure", exc_info=True)
+                                write_conn = None
+                                if attempt == DB_WRITE_MAX_RETRIES:
+                                    raise
+                                backoff = min(DB_WRITE_RETRY_BACKOFF ** attempt, 30)
+                                LOGGER.info("Retrying in %.2fs", backoff)
+                                time.sleep(backoff)
                         else:
-                            LOGGER.info("Encoder already loaded on %s; reusing.", device)
+                            raise RuntimeError("Exceeded maximum retries for database write")
+                        db_duration = time.perf_counter() - db_start
+
+                        iteration_processed += len(chunk)
+                        chunk_counter += 1
+                        grand_total += len(chunk)
+
+                        LOGGER.info(
+                            (
+                                "Iteration %d, chunk %d (global %d) stored: encode %.2fs, "
+                                "store %.2fs (iteration total %d, cumulative %d)"
+                            ),
+                            iteration_index,
+                            local_index,
+                            global_chunk_number,
+                            encode_duration,
+                            db_duration,
+                            iteration_processed,
+                            grand_total,
+                        )
 
                         fetch_start = time.perf_counter()
-                        all_chunks = chain([first_chunk], iterator)
-                        with conn.cursor() as cursor:
-                            for local_index, chunk in enumerate(all_chunks, start=1):
-                                if not chunk:
-                                    fetch_start = time.perf_counter()
-                                    continue
 
-                                fetch_duration = (
-                                    first_fetch_duration
-                                    if (iteration_processed == 0 and local_index == 1)
-                                    else time.perf_counter() - fetch_start
-                                )
-                                global_chunk_number = chunk_counter + 1
-                                LOGGER.info(
-                                    (
-                                        "Iteration %d, chunk %d (global %d): %d families "
-                                        "(IDs %s-%s) ready after %.2fs fetch wait"
-                                    ),
-                                    iteration_index,
-                                    local_index,
-                                    global_chunk_number,
-                                    len(chunk),
-                                    chunk[0].family_id,
-                                    chunk[-1].family_id,
-                                    fetch_duration,
-                                )
+            if no_more_pending:
+                break
 
-                                encode_start = time.perf_counter()
-                                embeddings = encode_families(chunk, tokenizer, model, device, max_length)
-                                encode_duration = time.perf_counter() - encode_start
+            if iteration_processed == 0:
+                LOGGER.info("Iteration %d yielded no families; stopping.", iteration_index)
+                break
 
-                                db_start = time.perf_counter()
-                                insert_embeddings(cursor, chunk, embeddings)
-                                conn.commit()
-                                db_duration = time.perf_counter() - db_start
+            LOGGER.info(
+                "Iteration %d completed; processed %d families (cumulative %d).",
+                iteration_index,
+                iteration_processed,
+                grand_total,
+            )
 
-                                iteration_processed += len(chunk)
-                                chunk_counter += 1
-                                grand_total += len(chunk)
-
-                                LOGGER.info(
-                                    (
-                                        "Iteration %d, chunk %d (global %d) stored: encode %.2fs, "
-                                        "store %.2fs (iteration total %d, cumulative %d)"
-                                    ),
-                                    iteration_index,
-                                    local_index,
-                                    global_chunk_number,
-                                    encode_duration,
-                                    db_duration,
-                                    iteration_processed,
-                                    grand_total,
-                                )
-
-                                fetch_start = time.perf_counter()
-
-                if no_more_pending:
-                    break
-
-                if iteration_processed == 0:
-                    LOGGER.info("Iteration %d yielded no families; stopping.", iteration_index)
-                    break
-
+            if iteration_processed < fetch_limit:
                 LOGGER.info(
-                    "Iteration %d completed; processed %d families (cumulative %d).",
+                    "Iteration %d processed fewer than fetch limit (%d); assuming queue drained.",
                     iteration_index,
-                    iteration_processed,
-                    grand_total,
+                    fetch_limit,
                 )
-
-                if iteration_processed < fetch_limit:
-                    LOGGER.info(
-                        "Iteration %d processed fewer than fetch limit (%d); assuming queue drained.",
-                        iteration_index,
-                        fetch_limit,
-                    )
-                    break
+                break
     except Exception:
         LOGGER.exception("Embedding generation failed")
         raise
+    finally:
+        if write_conn and not getattr(write_conn, "closed", 0):
+            write_conn.close()
 
     LOGGER.info("Embedding generation finished; processed %d families in total.", grand_total)
 
