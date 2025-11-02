@@ -4,8 +4,11 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
-from typing import Iterator, List, Sequence, Tuple
+from queue import Empty, Full, Queue
+from threading import Event, Thread
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import psycopg2
@@ -53,11 +56,6 @@ def load_env_file(env_path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
-def _chunked(iterable: Sequence[PatentFamily], chunk_size: int) -> Iterator[Sequence[PatentFamily]]:
-    for start in range(0, len(iterable), chunk_size):
-        yield iterable[start:start + chunk_size]
-
-
 def get_database_dsn() -> str:
     if (url := os.getenv("DATABASE_URL")):
         return url
@@ -78,37 +76,114 @@ def get_database_dsn() -> str:
     )
 
 
-def fetch_pending_patent_families(cursor, limit: int) -> List[PatentFamily]:
-    cursor.execute(
-        """
-        WITH filtered AS (
-            SELECT family_id::bigint AS family_id,
-                   title,
-                   abstract
-            FROM epo_doc_db.mv_patent_family
-            WHERE family_id ~ '^[0-9]+$'
-              AND title IS NOT NULL
-              AND btrim(title) <> ''
-              AND abstract IS NOT NULL
-              AND btrim(abstract) <> ''
-        )
-        SELECT f.family_id,
-               f.title,
-               f.abstract
-        FROM filtered f
-        WHERE NOT EXISTS (
-            SELECT 1
-            FROM export_embeddings e
-            WHERE e.docdb_family_id = f.family_id
-        )
-        ORDER BY f.family_id
-        LIMIT %s
-        """,
-        (limit,),
-    )
+PENDING_FAMILY_QUERY = """
+WITH filtered AS (
+    SELECT family_id::bigint AS family_id,
+           title,
+           abstract
+    FROM epo_doc_db.mv_patent_family
+    WHERE family_id ~ '^[0-9]+$'
+      AND title IS NOT NULL
+      AND btrim(title) <> ''
+      AND abstract IS NOT NULL
+      AND btrim(abstract) <> ''
+)
+SELECT f.family_id,
+       f.title,
+       f.abstract
+FROM filtered f
+WHERE NOT EXISTS (
+    SELECT 1
+    FROM export_embeddings e
+    WHERE e.docdb_family_id = f.family_id
+)
+ORDER BY f.family_id
+LIMIT %s
+"""
 
-    rows = cursor.fetchall()
-    return [PatentFamily(family_id=row[0], title=row[1], abstract=row[2]) for row in rows]
+
+class PendingFamilyStream:
+    """Background prefetcher that streams patent families awaiting embeddings."""
+
+    def __init__(self, dsn: str, fetch_limit: int, batch_size: int):
+        self._dsn = dsn
+        self._fetch_limit = max(fetch_limit, 0)
+        self._batch_size = max(batch_size, 1)
+        self._queue: Queue = Queue(maxsize=4)
+        self._sentinel = object()
+        self._stop_event = Event()
+        self._error: Optional[BaseException] = None
+        self._thread = Thread(
+            target=self._run,
+            name="pending-family-fetcher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        if self._fetch_limit == 0:
+            self._put(self._sentinel)
+            return
+
+        produced = 0
+        try:
+            with psycopg2.connect(self._dsn) as conn:
+                with conn.cursor(name="pending_families") as cursor:
+                    cursor.itersize = self._batch_size
+                    cursor.execute(PENDING_FAMILY_QUERY, (self._fetch_limit,))
+                    while not self._stop_event.is_set():
+                        rows = cursor.fetchmany(self._batch_size)
+                        if not rows:
+                            break
+                        families = [
+                            PatentFamily(family_id=row[0], title=row[1], abstract=row[2])
+                            for row in rows
+                        ]
+                        self._put(families)
+                        produced += len(families)
+                        if produced >= self._fetch_limit:
+                            break
+        except BaseException as exc:  # noqa: BLE001 - propagate to main thread
+            self._error = exc
+        finally:
+            self._put(self._sentinel)
+
+    def _put(self, item) -> None:
+        while True:
+            try:
+                self._queue.put(item, timeout=1)
+                return
+            except Full:
+                if self._stop_event.is_set():
+                    return
+
+    def close(self) -> None:
+        self._stop_event.set()
+        while True:
+            try:
+                self._queue.get_nowait()
+            except Empty:
+                break
+        self._put(self._sentinel)
+        self._thread.join(timeout=5)
+
+    def __iter__(self) -> "PendingFamilyStream":
+        return self
+
+    def __next__(self) -> List[PatentFamily]:
+        chunk = self._queue.get()
+        if chunk is self._sentinel:
+            self._thread.join(timeout=5)
+            if self._error:
+                raise RuntimeError("Failed to fetch pending patent families") from self._error
+            raise StopIteration
+        return chunk
+
+    def __enter__(self) -> "PendingFamilyStream":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
 
 def mean_pooling(model_output, attention_mask):
@@ -172,44 +247,64 @@ def main() -> None:
 
     LOGGER.info("Connecting to database")
     dsn = get_database_dsn()
+    total_processed = 0
     try:
         with psycopg2.connect(dsn) as conn:
             LOGGER.info("Database connection established")
-            LOGGER.info("Checking for pending families (limit %d)", fetch_limit)
-            with conn.cursor() as cursor:
-                families = fetch_pending_patent_families(cursor, fetch_limit)
+            LOGGER.info(
+                "Starting background fetcher (limit %d, batch size %d)",
+                fetch_limit,
+                batch_size,
+            )
+            with PendingFamilyStream(dsn, fetch_limit, batch_size) as stream:
+                iterator = iter(stream)
+                query_start = torch.cuda.Event(enable_timing=True) if torch.cuda.is_available() else None
+                query_end = torch.cuda.Event(enable_timing=True) if query_start else None
+                cpu_query_start = torch.cuda.Event(enable_timing=False) if query_start else None
+                try:
+                    first_chunk = next(iterator)
+                except StopIteration:
+                    LOGGER.info("No pending patent families found. Nothing to do.")
+                    return
 
-            if not families:
-                LOGGER.info("No pending patent families found. Nothing to do.")
-                return
+                LOGGER.info(
+                    "Pending families detected (initial chunk size: %d); loading encoder",
+                    len(first_chunk),
+                )
 
-            LOGGER.info("Found %d pending patent families; loading encoder", len(families))
+                tokenizer = AutoTokenizer.from_pretrained("mpi-inno-comp/paecter")
+                model = AutoModel.from_pretrained("mpi-inno-comp/paecter")
+                model.eval()
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                model.to(device)
+                LOGGER.info("Encoder ready; using device: %s", device)
 
-            tokenizer = AutoTokenizer.from_pretrained("mpi-inno-comp/paecter")
-            model = AutoModel.from_pretrained("mpi-inno-comp/paecter")
-            model.eval()
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            model.to(device)
-            LOGGER.info("Encoder ready; using device: %s", device)
-
-            with conn.cursor() as cursor:
-                for index, chunk in enumerate(_chunked(families, batch_size), start=1):
-                    LOGGER.info(
-                        "Encoding chunk %d with %d families (IDs %s-%s)",
-                        index,
-                        len(chunk),
-                        chunk[0].family_id,
-                        chunk[-1].family_id,
-                    )
-                    embeddings = encode_families(chunk, tokenizer, model, device, max_length)
-                    insert_embeddings(cursor, chunk, embeddings)
-                    conn.commit()
-                    LOGGER.info("Stored embeddings for chunk %d", index)
+                all_chunks = chain([first_chunk], iterator)
+                with conn.cursor() as cursor:
+                    for index, chunk in enumerate(all_chunks, start=1):
+                        if not chunk:
+                            continue
+                        LOGGER.info(
+                            "Encoding chunk %d with %d families (IDs %s-%s)",
+                            index,
+                            len(chunk),
+                            chunk[0].family_id,
+                            chunk[-1].family_id,
+                        )
+                        embeddings = encode_families(chunk, tokenizer, model, device, max_length)
+                        insert_embeddings(cursor, chunk, embeddings)
+                        conn.commit()
+                        total_processed += len(chunk)
+                        LOGGER.info(
+                            "Stored embeddings for chunk %d (processed %d families so far)",
+                            index,
+                            total_processed,
+                        )
     except Exception:
         LOGGER.exception("Embedding generation failed")
         raise
 
-    LOGGER.info("Embedding generation finished")
+    LOGGER.info("Embedding generation finished; processed %d families.", total_processed)
 
 
 if __name__ == "__main__":
