@@ -31,6 +31,193 @@ class PatentFamily:
         return f"{self.title.strip()}\n\n{self.abstract.strip()}"
 
 
+@dataclass(frozen=True)
+class RuntimeConfig:
+    device: torch.device
+    device_description: str
+    batch_size: int
+    fetch_limit: int
+    dtype: torch.dtype
+    auto_batch_size: bool
+    auto_fetch_limit: bool
+
+
+def detect_compute_device() -> Tuple[torch.device, str]:
+    """Determine the most capable execution device available."""
+
+    if torch.cuda.is_available():
+        try:
+            requested_index = int(os.getenv("PAECTER_CUDA_DEVICE", "0"))
+        except ValueError:
+            LOGGER.warning("Invalid PAECTER_CUDA_DEVICE value; defaulting to 0.")
+            requested_index = 0
+
+        device_count = torch.cuda.device_count()
+        if requested_index < 0 or requested_index >= device_count:
+            LOGGER.warning(
+                "Requested CUDA device %d out of range (total %d). Falling back to device 0.",
+                requested_index,
+                device_count,
+            )
+            requested_index = 0
+
+        device = torch.device(f"cuda:{requested_index}")
+        props = torch.cuda.get_device_properties(requested_index)
+        memory_gib = props.total_memory / (1024**3)
+        description = (
+            f"{torch.cuda.get_device_name(requested_index)} "
+            f"({memory_gib:.0f} GiB, compute {props.major}.{props.minor})"
+        )
+        return device, description
+
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps"), "Apple MPS"
+
+    return torch.device("cpu"), "CPU"
+
+
+def recommend_batch_size(device: torch.device) -> int:
+    """Pick a conservative batch size based on available accelerator memory."""
+
+    if device.type == "cuda":
+        index = device.index or 0
+        props = torch.cuda.get_device_properties(index)
+        memory_gib = props.total_memory / (1024**3)
+
+        if memory_gib >= 120:
+            return 64
+        if memory_gib >= 80:
+            return 56
+        if memory_gib >= 48:
+            return 40
+        if memory_gib >= 24:
+            return 32
+        if memory_gib >= 16:
+            return 24
+        return 16
+
+    if device.type == "mps":
+        return 24
+
+    return 16
+
+
+def resolve_batch_size(device: torch.device) -> Tuple[int, bool]:
+    raw = os.getenv("PAECTER_BATCH_SIZE")
+    if raw is None:
+        return recommend_batch_size(device), True
+
+    cleaned = raw.strip().lower()
+    if cleaned == "auto":
+        return recommend_batch_size(device), True
+
+    try:
+        value = int(cleaned)
+    except ValueError as exc:
+        raise ValueError(
+            f"PAECTER_BATCH_SIZE must be an integer or 'auto'; received {raw!r}."
+        ) from exc
+
+    if value <= 0:
+        raise ValueError("PAECTER_BATCH_SIZE must be positive.")
+    return value, False
+
+
+def resolve_fetch_limit(batch_size: int) -> Tuple[int, bool]:
+    raw = os.getenv("PAECTER_FETCH_LIMIT")
+    multiplier_raw = os.getenv("PAECTER_AUTO_FETCH_MULTIPLIER", "8")
+    try:
+        multiplier = max(int(multiplier_raw), 1)
+    except ValueError:
+        LOGGER.warning(
+            "Invalid PAECTER_AUTO_FETCH_MULTIPLIER value %r; defaulting to 8.",
+            multiplier_raw,
+        )
+        multiplier = 8
+
+    if raw is None:
+        return max(batch_size * multiplier, batch_size), True
+
+    cleaned = raw.strip().lower()
+    if cleaned == "auto":
+        return max(batch_size * multiplier, batch_size), True
+
+    try:
+        value = int(cleaned)
+    except ValueError as exc:
+        raise ValueError(
+            f"PAECTER_FETCH_LIMIT must be an integer or 'auto'; received {raw!r}."
+        ) from exc
+
+    if value < batch_size:
+        LOGGER.warning(
+            "Fetch limit %d is smaller than batch size %d; increasing fetch limit to match.",
+            value,
+            batch_size,
+        )
+        value = batch_size
+    return value, False
+
+
+def resolve_model_dtype(device: torch.device) -> torch.dtype:
+    raw = os.getenv("PAECTER_MODEL_DTYPE")
+    if raw:
+        cleaned = raw.strip().lower()
+        dtype_map = {
+            "fp32": torch.float32,
+            "float32": torch.float32,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+        }
+        if cleaned not in dtype_map:
+            raise ValueError(
+                f"Unsupported PAECTER_MODEL_DTYPE value {raw!r}; "
+                "expected one of fp32, fp16, bf16, float32, float16, bfloat16."
+            )
+        dtype = dtype_map[cleaned]
+    else:
+        dtype = torch.float16 if device.type == "cuda" else torch.float32
+
+    if device.type != "cuda" and dtype == torch.float16:
+        LOGGER.warning("Float16 requested on non-CUDA device; using float32 instead.")
+        dtype = torch.float32
+
+    if device.type == "mps" and dtype == torch.bfloat16:
+        LOGGER.warning("bfloat16 not supported on MPS; using float32 instead.")
+        dtype = torch.float32
+
+    return dtype
+
+
+def prepare_runtime_config() -> RuntimeConfig:
+    device, description = detect_compute_device()
+    batch_size, auto_batch = resolve_batch_size(device)
+    fetch_limit, auto_fetch = resolve_fetch_limit(batch_size)
+    dtype = resolve_model_dtype(device)
+
+    LOGGER.info(
+        "Runtime configuration resolved: device=%s, dtype=%s, batch_size=%d%s, fetch_limit=%d%s",
+        description,
+        str(dtype).replace("torch.", ""),
+        batch_size,
+        " (auto)" if auto_batch else "",
+        fetch_limit,
+        " (auto)" if auto_fetch else "",
+    )
+
+    return RuntimeConfig(
+        device=device,
+        device_description=description,
+        batch_size=batch_size,
+        fetch_limit=fetch_limit,
+        dtype=dtype,
+        auto_batch_size=auto_batch,
+        auto_fetch_limit=auto_fetch,
+    )
+
+
 def load_env_file(env_path: Path) -> None:
     """Load environment variables from a simple ``.env`` style file.
 
@@ -59,6 +246,9 @@ def load_env_file(env_path: Path) -> None:
 
 def get_database_dsn() -> str:
     if (url := os.getenv("DATABASE_URL")):
+        if "sslmode" not in url:
+            delimiter = "&" if "?" in url else "?"
+            url = f"{url}{delimiter}sslmode={os.getenv('SQL_SSLMODE', 'require')}"
         return url
 
     required_keys = ["SQL_HOST", "SQL_PORT", "SQL_DATABASE", "SQL_USER", "SQL_PASSWORD"]
@@ -73,8 +263,14 @@ def get_database_dsn() -> str:
         f"port={os.environ['SQL_PORT']} "
         f"dbname={os.environ['SQL_DATABASE']} "
         f"user={os.environ['SQL_USER']} "
-        f"password={os.environ['SQL_PASSWORD']}"
+        f"password={os.environ['SQL_PASSWORD']} "
+        f"sslmode={os.getenv('SQL_SSLMODE', 'require')}"
     )
+
+    if sslrootcert := os.getenv("SQL_SSLROOTCERT"):
+        return dsn + f" sslrootcert={sslrootcert}"
+
+    return dsn
 
 
 PENDING_FAMILY_QUERY = """
@@ -245,9 +441,10 @@ def main() -> None:
     LOGGER.info("Loading environment variables from %s", env_path)
     load_env_file(Path(env_path))
 
-    fetch_limit = int(os.getenv("PAECTER_FETCH_LIMIT", "256"))
-    batch_size = int(os.getenv("PAECTER_BATCH_SIZE", "16"))
     max_length = int(os.getenv("PAECTER_MAX_LENGTH", "512"))
+    runtime_config = prepare_runtime_config()
+    batch_size = runtime_config.batch_size
+    fetch_limit = runtime_config.fetch_limit
 
     LOGGER.info("Connecting to database")
     dsn = get_database_dsn()
@@ -257,7 +454,6 @@ def main() -> None:
     iteration_index = 0
     tokenizer: Optional[AutoTokenizer] = None
     model: Optional[AutoModel] = None
-    device: Optional[torch.device] = None
     try:
         LOGGER.info("Starting embedding loop with fetch limit %d and batch size %d", fetch_limit, batch_size)
         while True:
@@ -293,17 +489,30 @@ def main() -> None:
                         first_fetch_duration,
                     )
 
-                    if tokenizer is None or model is None or device is None:
+                    if tokenizer is None or model is None:
                         encoder_load_start = time.perf_counter()
                         tokenizer = AutoTokenizer.from_pretrained("mpi-inno-comp/paecter")
-                        model = AutoModel.from_pretrained("mpi-inno-comp/paecter")
+                        model_kwargs = {}
+                        if runtime_config.dtype is not None:
+                            model_kwargs["torch_dtype"] = runtime_config.dtype
+                        model = AutoModel.from_pretrained("mpi-inno-comp/paecter", **model_kwargs)
                         model.eval()
-                        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                        model.to(device)
+                        model.to(runtime_config.device)
+                        if runtime_config.device.type == "cuda":
+                            torch.cuda.set_device(runtime_config.device)
+                            torch.backends.cuda.matmul.allow_tf32 = True
+                            torch.backends.cudnn.benchmark = True
                         encoder_load_duration = time.perf_counter() - encoder_load_start
-                        LOGGER.info("Encoder loaded on %s in %.2fs", device, encoder_load_duration)
+                        LOGGER.info(
+                            "Encoder loaded on %s in %.2fs",
+                            runtime_config.device_description,
+                            encoder_load_duration,
+                        )
                     else:
-                        LOGGER.info("Encoder already loaded on %s; reusing.", device)
+                        LOGGER.info(
+                            "Encoder already loaded on %s; reusing.",
+                            runtime_config.device_description,
+                        )
 
                     fetch_start = time.perf_counter()
                     all_chunks = chain([first_chunk], iterator)
@@ -334,7 +543,13 @@ def main() -> None:
                         )
 
                         encode_start = time.perf_counter()
-                        embeddings = encode_families(chunk, tokenizer, model, device, max_length)
+                        embeddings = encode_families(
+                            chunk,
+                            tokenizer,
+                            model,
+                            runtime_config.device,
+                            max_length,
+                        )
                         encode_duration = time.perf_counter() - encode_start
 
                         db_start = time.perf_counter()
@@ -423,5 +638,41 @@ def main() -> None:
     LOGGER.info("Embedding generation finished; processed %d families in total.", grand_total)
 
 
+def run_with_restarts() -> None:
+    """Execute main with simple recovery behaviour for transient failures."""
+
+    restart_delay = float(os.getenv("PAECTER_RESTART_DELAY", "60"))
+    max_restarts_env = os.getenv("PAECTER_MAX_RESTARTS", 5)
+    max_restarts: Optional[int] = int(max_restarts_env) if max_restarts_env else None
+
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            main()
+        except KeyboardInterrupt:
+            LOGGER.info("Interrupted by user; shutting down without restart.")
+            break
+        except Exception:
+            LOGGER.exception("Run attempt %d failed; recoverable error detected.", attempt)
+            if max_restarts is not None and attempt >= max_restarts:
+                LOGGER.error(
+                    "Reached maximum restarts (%d); aborting and propagating last error.",
+                    max_restarts,
+                )
+                raise
+            LOGGER.info(
+                "Restarting main() after %.2fs delay (next attempt %d).",
+                restart_delay,
+                attempt + 1,
+            )
+            time.sleep(restart_delay)
+            continue
+        else:
+            if attempt > 1:
+                LOGGER.info("Run attempt %d succeeded after prior recoveries.", attempt)
+            break
+
+
 if __name__ == "__main__":
-    main()
+    run_with_restarts()
