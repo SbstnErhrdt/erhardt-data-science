@@ -76,25 +76,75 @@ def detect_compute_device() -> Tuple[torch.device, str]:
     return torch.device("cpu"), "CPU"
 
 
-def recommend_batch_size(device: torch.device) -> int:
-    """Pick a conservative batch size based on available accelerator memory."""
+def _default_sample_memory_mb(dtype: torch.dtype) -> float:
+    if dtype == torch.float16:
+        return 42.0
+    if dtype == torch.bfloat16:
+        return 48.0
+    return 84.0
+
+
+def recommend_batch_size(device: torch.device, dtype: torch.dtype) -> int:
+    """Pick a dynamic batch size based on accelerator memory."""
 
     if device.type == "cuda":
         index = device.index or 0
         props = torch.cuda.get_device_properties(index)
-        memory_gib = props.total_memory / (1024**3)
+        total_bytes = props.total_memory
 
-        if memory_gib >= 120:
-            return 64
-        if memory_gib >= 80:
-            return 56
-        if memory_gib >= 48:
-            return 40
-        if memory_gib >= 24:
-            return 32
-        if memory_gib >= 16:
-            return 24
-        return 16
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(device)
+        except RuntimeError:
+            free_bytes = total_bytes
+
+        try:
+            target_ratio = float(os.getenv("PAECTER_GPU_MEMORY_TARGET", "0.9"))
+        except ValueError:
+            LOGGER.warning(
+                "Invalid PAECTER_GPU_MEMORY_TARGET value; defaulting to 0.9.",
+            )
+            target_ratio = 0.9
+
+        target_ratio = min(max(target_ratio, 0.1), 0.98)
+
+        try:
+            per_sample_mb = float(
+                os.getenv(
+                    "PAECTER_MEM_MB_PER_SAMPLE",
+                    str(_default_sample_memory_mb(dtype)),
+                )
+            )
+        except ValueError:
+            LOGGER.warning(
+                "Invalid PAECTER_MEM_MB_PER_SAMPLE value; using default estimate.",
+            )
+            per_sample_mb = _default_sample_memory_mb(dtype)
+
+        per_sample_bytes = max(int(per_sample_mb * 1024 * 1024), 1)
+        usable_bytes = min(int(total_bytes * target_ratio), free_bytes)
+        estimated = max(usable_bytes // per_sample_bytes, 1)
+
+        try:
+            max_auto = int(os.getenv("PAECTER_MAX_AUTO_BATCH", "128"))
+        except ValueError:
+            LOGGER.warning("Invalid PAECTER_MAX_AUTO_BATCH value; defaulting to 128.")
+            max_auto = 128
+
+        estimated = min(estimated, max_auto)
+
+        try:
+            granularity = max(int(os.getenv("PAECTER_BATCH_GRANULARITY", "8")), 1)
+        except ValueError:
+            LOGGER.warning(
+                "Invalid PAECTER_BATCH_GRANULARITY value; defaulting to 8.",
+            )
+            granularity = 8
+
+        estimated = max(
+            granularity,
+            (estimated // granularity) * granularity or granularity,
+        )
+        return estimated
 
     if device.type == "mps":
         return 24
@@ -102,14 +152,14 @@ def recommend_batch_size(device: torch.device) -> int:
     return 16
 
 
-def resolve_batch_size(device: torch.device) -> Tuple[int, bool]:
+def resolve_batch_size(device: torch.device, dtype: torch.dtype) -> Tuple[int, bool]:
     raw = os.getenv("PAECTER_BATCH_SIZE")
     if raw is None:
-        return recommend_batch_size(device), True
+        return recommend_batch_size(device, dtype), True
 
     cleaned = raw.strip().lower()
     if cleaned == "auto":
-        return recommend_batch_size(device), True
+        return recommend_batch_size(device, dtype), True
 
     try:
         value = int(cleaned)
@@ -193,9 +243,9 @@ def resolve_model_dtype(device: torch.device) -> torch.dtype:
 
 def prepare_runtime_config() -> RuntimeConfig:
     device, description = detect_compute_device()
-    batch_size, auto_batch = resolve_batch_size(device)
-    fetch_limit, auto_fetch = resolve_fetch_limit(batch_size)
     dtype = resolve_model_dtype(device)
+    batch_size, auto_batch = resolve_batch_size(device, dtype)
+    fetch_limit, auto_fetch = resolve_fetch_limit(batch_size)
 
     LOGGER.info(
         "Runtime configuration resolved: device=%s, dtype=%s, batch_size=%d%s, fetch_limit=%d%s",
