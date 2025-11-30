@@ -327,24 +327,44 @@ PENDING_FAMILY_QUERY = """
 WITH filtered AS (
     SELECT family_id::bigint AS family_id,
            title,
-           abstract
+           abstract,
+           family_authorities
     FROM epo_doc_db.mv_patent_family
     WHERE family_id ~ '^[0-9]+$'
       AND title IS NOT NULL
       AND btrim(title) <> ''
       AND abstract IS NOT NULL
       AND btrim(abstract) <> ''
+),
+prioritized AS (
+    SELECT f.family_id,
+           f.title,
+           f.abstract,
+           CASE
+               WHEN EXISTS (
+                   SELECT 1
+                   FROM unnest(COALESCE(f.family_authorities, ARRAY[]::character varying[])) AS auth(authority)
+                   WHERE upper(auth.authority) = 'EP'
+               ) THEN 1
+               WHEN EXISTS (
+                   SELECT 1
+                   FROM unnest(COALESCE(f.family_authorities, ARRAY[]::character varying[])) AS auth(authority)
+                   WHERE upper(auth.authority) = 'US'
+               ) THEN 2
+               ELSE 3
+           END AS priority_bucket
+    FROM filtered f
 )
-SELECT f.family_id,
-       f.title,
-       f.abstract
-FROM filtered f
+SELECT p.family_id,
+       p.title,
+       p.abstract
+FROM prioritized p
 WHERE NOT EXISTS (
     SELECT 1
     FROM export_embeddings e
-    WHERE e.docdb_family_id = f.family_id
+    WHERE e.docdb_family_id = p.family_id
 )
-ORDER BY f.family_id
+ORDER BY p.priority_bucket, random()
 LIMIT %s
 """
 
