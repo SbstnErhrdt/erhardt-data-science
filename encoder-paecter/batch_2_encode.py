@@ -4,7 +4,7 @@ import argparse
 import logging
 import os
 from pathlib import Path
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, Tuple
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -27,14 +27,17 @@ class PatentFamily:
         return f"{self.title.strip()}\n\n{self.abstract.strip()}"
 
 
-def detect_device() -> torch.device:
+def detect_device() -> Tuple[torch.device, int]:
     if torch.cuda.is_available():
+        use_all = os.getenv("PAECTER_USE_ALL_GPUS", "1").lower() not in {"0", "false", "no"}
+        if use_all and torch.cuda.device_count() > 1:
+            return torch.device("cuda:0"), torch.cuda.device_count()
         index = int(os.getenv("PAECTER_CUDA_DEVICE", "0"))
         index = max(min(index, torch.cuda.device_count() - 1), 0)
-        return torch.device(f"cuda:{index}")
+        return torch.device(f"cuda:{index}"), 1
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+        return torch.device("mps"), 1
+    return torch.device("cpu"), 1
 
 
 def mean_pooling(model_output, attention_mask):
@@ -149,18 +152,21 @@ def main() -> None:
     to_encode_dir, to_upload_dir = resolve_run_dirs(date_str, base_dir=base_dir)
     to_upload_dir.mkdir(parents=True, exist_ok=True)
 
-    device = detect_device()
+    device, device_count = detect_device()
     dtype = torch.float16 if device.type == "cuda" else torch.float32
     encode_batch_size = int(os.getenv("PAECTER_BATCH_SIZE", "32"))
+    if device.type == "cuda" and device_count > 1:
+        encode_batch_size *= device_count
     max_length = int(os.getenv("PAECTER_MAX_LENGTH", "512"))
     parquet_batch_size = int(os.getenv("PAECTER_PARQUET_BATCH_SIZE", "512"))
     insert_batch_size = int(os.getenv("PAECTER_SQL_INSERT_BATCH", "1000"))
 
+    device_desc = f"{device} (x{device_count} GPUs)" if device.type == "cuda" and device_count > 1 else str(device)
     LOGGER.info(
         "Encoding from %s into %s (device=%s, encode batch=%d, parquet batch=%d, insert batch=%d)",
         to_encode_dir,
         to_upload_dir,
-        device,
+        device_desc,
         encode_batch_size,
         parquet_batch_size,
         insert_batch_size,
@@ -170,6 +176,8 @@ def main() -> None:
     model_kwargs = {"torch_dtype": dtype}
     model = AutoModel.from_pretrained("mpi-inno-comp/paecter", **model_kwargs)
     model.to(device)
+    if device.type == "cuda" and device_count > 1:
+        model = torch.nn.DataParallel(model, device_ids=list(range(device_count)))
     model.eval()
     if device.type == "cuda":
         torch.cuda.set_device(device)
